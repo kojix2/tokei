@@ -4,13 +4,13 @@ use arbitrary::Arbitrary;
 /// information about the language, such as multi line comments, single line
 /// comments, string literal syntax, whether a given language allows nesting
 /// comments.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[derive(Arbitrary, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 #[allow(clippy::upper_case_acronyms)]
 pub enum LanguageType {
-    {% for key, _ in languages -%}
-        #[allow(missing_docs)] {{key}},
+    {% for key, value in languages -%}
+        #[allow(missing_docs)] {% if value.name is defined %} #[serde(alias = "{{value.name}}")] {% else %} #[serde(alias = "{{key}}")] {% endif %} {{key}},
     {% endfor %}
 }
 
@@ -294,7 +294,7 @@ impl LanguageType {
 
         match fsutils::get_extension(entry) {
             Some(extension) => LanguageType::from_file_extension(extension.as_str()),
-            None => LanguageType::from_shebang(&entry),
+            None => LanguageType::from_shebang(entry),
         }
     }
 
@@ -317,6 +317,31 @@ impl LanguageType {
             {%- endfor %}
             extension => {
                 warn!("Unknown extension: {}", extension);
+                None
+            },
+        }
+    }
+
+    /// Get language from its name.
+    ///
+    /// ```no_run
+    /// use tokei::LanguageType;
+    ///
+    /// let rust = LanguageType::from_name("Rust");
+    ///
+    /// assert_eq!(rust, Some(LanguageType::Rust));
+    /// ```
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            {% for key, value in languages -%}
+                {% if value.name and value.name != key -%}
+                    | "{{value.name}}"
+                {% endif -%}
+                    | "{{key}}" => Some({{key}}),
+            {% endfor %}
+            unknown => {
+                warn!("Unknown language name: {}", unknown);
                 None
             },
         }
@@ -356,16 +381,23 @@ impl LanguageType {
     /// assert_eq!(rust, Some(LanguageType::Rust));
     /// ```
     pub fn from_shebang<P: AsRef<Path>>(entry: P) -> Option<Self> {
-        let file = match File::open(entry) {
-            Ok(file) => file,
-            _ => return None,
-        };
+        // Read at max `READ_LIMIT` bytes from the given file.
+        // A typical shebang line has a length less than 32 characters;
+        // e.g. '#!/bin/bash' - 11B / `#!/usr/bin/env python3` - 22B
+        // It is *very* unlikely the file contains a valid shebang syntax
+        // if we don't find a newline character after searching the first 128B.
+        const READ_LIMIT: usize = 128;
 
-        let mut buf = BufReader::new(file);
-        let mut line = String::new();
-        let _ = buf.read_line(&mut line);
+        let mut file = File::open(entry).ok()?;
+        let mut buf = [0; READ_LIMIT];
 
-        let mut words = line.split_whitespace();
+        let len = file.read(&mut buf).ok()?;
+        let buf = &buf[..len];
+
+        let first_line = buf.split(|b| *b == b'\n').next()?;
+        let first_line = std::str::from_utf8(first_line).ok()?;
+
+        let mut words = first_line.split_whitespace();
         match words.next() {
             {# First match against any shebang paths, and then check if the
                language matches any found in the environment shebang path. #}
@@ -380,7 +412,13 @@ impl LanguageType {
                     match word {
                         {% for key, value in languages -%}
                             {%- if value.env -%}
-                                {%- for item in value.env  %}| "{{item}}" {% endfor %}=> Some({{key}}),
+                                {%- for item in value.env  %}
+                                    {% if loop.index == 1 %}
+                                        _ if word.starts_with("{{item}}")
+                                    {% else %}
+                                        || word.starts_with("{{item}}")
+                                    {% endif %}
+                                {% endfor %}=> Some({{key}}),
                             {% endif -%}
                         {%- endfor %}
                         env => {
